@@ -1525,6 +1525,11 @@ static void SendSteamHandleUpdateEvents(void)
     for (joystick = SDL_joysticks; joystick; joystick = joystick->next) {
         bool changed = false;
 
+        if (!joystick->attached) {
+            // Don't send events for joysticks that have been removed
+            continue;
+        }
+
         if (!SDL_IsGamepad(joystick->instance_id)) {
             continue;
         }
@@ -1630,6 +1635,10 @@ static void RunJoystickUpdates(void)
 
     if (SDL_EventEnabled(SDL_EVENT_JOYSTICK_UPDATE_COMPLETE)) {
         for (SDL_Joystick *joystick = SDL_joysticks; joystick; joystick = joystick->next) {
+            if (!joystick->attached) {
+                // Don't send events for joysticks that have been removed
+                continue;
+            }
             if (joystick->update_complete) {
                 SDL_Event *event;
                 SDL_JoystickEventEntry *entry = SDL_AllocJoystickEvent(SDL_EVENT_JOYSTICK_UPDATE_COMPLETE, joystick->update_complete, &event);

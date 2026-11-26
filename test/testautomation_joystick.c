@@ -280,6 +280,174 @@ static int SDLCALL joystick_testMappings(void *arg)
 }
 
 /**
+ * Check that device and input event lifecycles stay consistent when
+ * gamepads are unplugged and replugged while input is still pending.
+ */
+static int SDLCALL joystick_testHotplugEvents(void *arg)
+{
+    SDL_VirtualJoystickDesc desc;
+    SDL_JoystickID device_a = 0, device_b = 0, device_c = 0;
+    SDL_Gamepad *gamepad_a = NULL, *gamepad_b = NULL, *gamepad_c = NULL;
+    int player_a, player_b;
+    SDL_Event event;
+    bool joystick_removed = false;
+    bool gamepad_removed = false;
+    bool events_after_removed = false;
+
+    SDL_INIT_INTERFACE(&desc);
+    desc.type = SDL_JOYSTICK_TYPE_GAMEPAD;
+    desc.naxes = SDL_GAMEPAD_AXIS_COUNT;
+    desc.nbuttons = SDL_GAMEPAD_BUTTON_COUNT;
+    desc.vendor_id = USB_VENDOR_NVIDIA;
+    desc.product_id = USB_PRODUCT_NVIDIA_SHIELD_CONTROLLER_V103;
+    desc.name = "Virtual NVIDIA SHIELD Controller";
+
+    /* Make sure no stale events (or a leftover poll sentinel) are pending */
+    SDL_FlushEvents(SDL_EVENT_FIRST, SDL_EVENT_LAST);
+
+    device_a = SDL_AttachVirtualJoystick(&desc);
+    SDLTest_AssertCheck(device_a > 0, "SDL_AttachVirtualJoystick() -> %" SDL_PRIs32 " (expected > 0)", device_a);
+    device_b = SDL_AttachVirtualJoystick(&desc);
+    SDLTest_AssertCheck(device_b > 0, "SDL_AttachVirtualJoystick() -> %" SDL_PRIs32 " (expected > 0)", device_b);
+    if (!device_a || !device_b) {
+        return TEST_ABORTED;
+    }
+    SDLTest_AssertCheck(device_a != device_b, "attached gamepads have distinct instance IDs");
+
+    gamepad_a = SDL_OpenGamepad(device_a);
+    SDLTest_AssertCheck(gamepad_a != NULL, "SDL_OpenGamepad() for the first gamepad");
+    gamepad_b = SDL_OpenGamepad(device_b);
+    SDLTest_AssertCheck(gamepad_b != NULL, "SDL_OpenGamepad() for the second gamepad");
+    if (!gamepad_a || !gamepad_b) {
+        return TEST_ABORTED;
+    }
+
+    player_a = SDL_GetGamepadPlayerIndex(gamepad_a);
+    player_b = SDL_GetGamepadPlayerIndex(gamepad_b);
+    SDLTest_AssertCheck(player_a >= 0 && player_b >= 0 && player_a != player_b,
+                        "gamepads have distinct player indices (%d and %d)", player_a, player_b);
+
+    /* Queue input on both gamepads */
+    SDLTest_AssertCheck(SDL_SetJoystickVirtualButton(SDL_GetGamepadJoystick(gamepad_a), SDL_GAMEPAD_BUTTON_SOUTH, true),
+                        "SDL_SetJoystickVirtualButton() on the first gamepad");
+    SDLTest_AssertCheck(SDL_SetJoystickVirtualButton(SDL_GetGamepadJoystick(gamepad_b), SDL_GAMEPAD_BUTTON_SOUTH, true),
+                        "SDL_SetJoystickVirtualButton() on the second gamepad");
+    SDL_UpdateJoysticks();
+
+    /* Unplug the first gamepad and plug in a new one while input is pending */
+    SDLTest_AssertCheck(SDL_DetachVirtualJoystick(device_a), "SDL_DetachVirtualJoystick()");
+    device_c = SDL_AttachVirtualJoystick(&desc);
+    SDLTest_AssertCheck(device_c > 0, "SDL_AttachVirtualJoystick() -> %" SDL_PRIs32 " (expected > 0)", device_c);
+    SDLTest_AssertCheck(device_c != device_a && device_c != device_b,
+                        "reconnected gamepad gets a new instance ID (%" SDL_PRIs32 ")", device_c);
+
+    /* Drain the event queue: nothing may arrive for the removed gamepad
+     * after its removal events have been delivered. */
+    SDL_UpdateJoysticks();
+    SDL_PumpEvents();
+    while (SDL_PollEvent(&event)) {
+        Uint32 which = 0;
+        bool joystick_event = false;
+        bool gamepad_event = false;
+
+        switch (event.type) {
+        case SDL_EVENT_JOYSTICK_ADDED:
+        case SDL_EVENT_JOYSTICK_REMOVED:
+        case SDL_EVENT_JOYSTICK_UPDATE_COMPLETE:
+            which = event.jdevice.which;
+            joystick_event = true;
+            break;
+        case SDL_EVENT_JOYSTICK_AXIS_MOTION:
+            which = event.jaxis.which;
+            joystick_event = true;
+            break;
+        case SDL_EVENT_JOYSTICK_BALL_MOTION:
+            which = event.jball.which;
+            joystick_event = true;
+            break;
+        case SDL_EVENT_JOYSTICK_HAT_MOTION:
+            which = event.jhat.which;
+            joystick_event = true;
+            break;
+        case SDL_EVENT_JOYSTICK_BUTTON_DOWN:
+        case SDL_EVENT_JOYSTICK_BUTTON_UP:
+            which = event.jbutton.which;
+            joystick_event = true;
+            break;
+        case SDL_EVENT_JOYSTICK_BATTERY_UPDATED:
+            which = event.jbattery.which;
+            joystick_event = true;
+            break;
+        case SDL_EVENT_GAMEPAD_ADDED:
+        case SDL_EVENT_GAMEPAD_REMOVED:
+        case SDL_EVENT_GAMEPAD_REMAPPED:
+        case SDL_EVENT_GAMEPAD_UPDATE_COMPLETE:
+        case SDL_EVENT_GAMEPAD_STEAM_HANDLE_UPDATED:
+            which = event.gdevice.which;
+            gamepad_event = true;
+            break;
+        case SDL_EVENT_GAMEPAD_AXIS_MOTION:
+            which = event.gaxis.which;
+            gamepad_event = true;
+            break;
+        case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
+        case SDL_EVENT_GAMEPAD_BUTTON_UP:
+            which = event.gbutton.which;
+            gamepad_event = true;
+            break;
+        default:
+            break;
+        }
+
+        if (event.type == SDL_EVENT_JOYSTICK_REMOVED && which == device_a) {
+            joystick_removed = true;
+        } else if (event.type == SDL_EVENT_GAMEPAD_REMOVED && which == device_a) {
+            gamepad_removed = true;
+        } else if (which == device_a) {
+            if ((joystick_event && joystick_removed) || (gamepad_event && gamepad_removed)) {
+                events_after_removed = true;
+            }
+        }
+    }
+    SDLTest_AssertCheck(joystick_removed, "SDL_EVENT_JOYSTICK_REMOVED received for the unplugged gamepad");
+    SDLTest_AssertCheck(gamepad_removed, "SDL_EVENT_GAMEPAD_REMOVED received for the unplugged gamepad");
+    SDLTest_AssertCheck(!events_after_removed, "no events for the unplugged gamepad after its removal events");
+
+    /* The gamepad that stayed connected is unaffected */
+    SDLTest_AssertCheck(SDL_GamepadConnected(gamepad_b), "second gamepad is still connected");
+    SDLTest_AssertCheck(SDL_GetGamepadPlayerIndex(gamepad_b) == player_b,
+                        "second gamepad kept its player index (%d)", player_b);
+    SDLTest_AssertCheck(SDL_GetGamepadButton(gamepad_b, SDL_GAMEPAD_BUTTON_SOUTH) == true,
+                        "second gamepad kept its input state");
+
+    /* The unplugged gamepad is offline and recentered */
+    SDLTest_AssertCheck(!SDL_GamepadConnected(gamepad_a), "first gamepad is no longer connected");
+    SDLTest_AssertCheck(SDL_GetGamepadPlayerIndex(gamepad_a) == -1,
+                        "first gamepad no longer has a player index");
+    SDLTest_AssertCheck(SDL_GetGamepadButton(gamepad_a, SDL_GAMEPAD_BUTTON_SOUTH) == false,
+                        "first gamepad was recentered");
+
+    /* The new gamepad only presents its own fresh state */
+    SDLTest_AssertCheck(SDL_IsGamepad(device_c), "new gamepad is recognized as a gamepad");
+    gamepad_c = SDL_OpenGamepad(device_c);
+    SDLTest_AssertCheck(gamepad_c != NULL, "SDL_OpenGamepad() for the new gamepad");
+    if (gamepad_c) {
+        SDLTest_AssertCheck(SDL_GetGamepadPlayerIndex(gamepad_c) == player_a,
+                            "new gamepad got the freed player index (%d)", player_a);
+        SDLTest_AssertCheck(SDL_GetGamepadButton(gamepad_c, SDL_GAMEPAD_BUTTON_SOUTH) == false,
+                            "new gamepad starts with fresh input state");
+        SDL_CloseGamepad(gamepad_c);
+    }
+
+    SDL_CloseGamepad(gamepad_a);
+    SDL_CloseGamepad(gamepad_b);
+    SDLTest_AssertCheck(SDL_DetachVirtualJoystick(device_b), "SDL_DetachVirtualJoystick()");
+    SDLTest_AssertCheck(SDL_DetachVirtualJoystick(device_c), "SDL_DetachVirtualJoystick()");
+
+    return TEST_COMPLETED;
+}
+
+/**
  * Missing joystick axes must not become half-pressed gamepad triggers.
  */
 static int SDLCALL joystick_testMissingAxes(void *arg)
@@ -353,12 +521,16 @@ static const SDLTest_TestCaseReference joystickTest2 = {
 static const SDLTest_TestCaseReference joystickTest3 = {
     joystick_testMissingAxes, "joystick_testMissingAxes", "Test mappings with missing joystick axes", TEST_ENABLED
 };
+static const SDLTest_TestCaseReference joystickTest4 = {
+    joystick_testHotplugEvents, "joystick_testHotplugEvents", "Test device and event lifecycle across hotplug", TEST_ENABLED
+};
 
 /* Sequence of Joystick routine test cases */
 static const SDLTest_TestCaseReference *joystickTests[] = {
     &joystickTest1,
     &joystickTest2,
     &joystickTest3,
+    &joystickTest4,
     NULL
 };
 
