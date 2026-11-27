@@ -550,6 +550,36 @@ static SDL_AudioDevice *ObtainPhysicalAudioDeviceDefaultAllowed(SDL_AudioDeviceI
     return NULL;
 }
 
+// Drop any samples still queued on a playback stream that is being detached from
+// its device. This runs while the physical device lock is held (which quiesces the
+// audio callback), so the stream cannot be in active use. A device that is reopened
+// or reused after a close/unbind must only process samples fed to it afterwards,
+// never leftovers queued for the previous device run. Recording streams are left
+// untouched, since their queued data belongs to the app rather than the hardware.
+static void DetachPlaybackStream(SDL_AudioDevice *device, SDL_AudioStream *stream)
+{
+    if (!device->recording) {
+        SDL_ClearAudioStream(stream);
+    }
+}
+
+// Clear every sample still queued on playback streams bound to this device.
+// Called when a physical device is being (re)opened, after the previous device
+// thread has been joined and before the new one starts, so no callback can race us.
+// A reopened device must only process samples fed to it after the reopen.
+static void FlushBoundPlaybackStreams(SDL_AudioDevice *device)
+{
+    if (device->recording) {
+        return;  // recording data is produced for the app and must survive a reopen.
+    }
+
+    for (SDL_LogicalAudioDevice *logdev = device->logical_devices; logdev; logdev = logdev->next) {
+        for (SDL_AudioStream *stream = logdev->bound_streams; stream; stream = stream->next_binding) {
+            SDL_ClearAudioStream(stream);
+        }
+    }
+}
+
 // this assumes you hold the _physical_ device lock for this logical device! This will not unlock the lock or close the physical device!
 //  It also will not unref the physical device, since we might be shutting down; SDL_CloseAudioDevice handles the unref.
 static void DestroyLogicalAudioDevice(SDL_LogicalAudioDevice *logdev)
@@ -577,6 +607,9 @@ static void DestroyLogicalAudioDevice(SDL_LogicalAudioDevice *logdev)
     for (SDL_AudioStream *stream = logdev->bound_streams; stream; stream = next) {
         SDL_LockMutex(stream->lock);
         next = stream->next_binding;
+        // Discard samples queued for this device run before the stream is detached,
+        // so a later reopen/reuse cannot replay stale audio.
+        DetachPlaybackStream(logdev->physical_device, stream);
         stream->next_binding = NULL;
         stream->prev_binding = NULL;
         stream->bound_device = NULL;
@@ -1991,6 +2024,11 @@ static bool OpenPhysicalAudioDevice(SDL_AudioDevice *device, const SDL_AudioSpec
     if (!current_audio.impl.ProvidesOwnCallbackThread) {
         char threadname[64];
         SDL_GetAudioThreadName(device, threadname, sizeof (threadname));
+
+        // Any samples left over from a previous device run must not be replayed on
+        // the freshly opened device. Drop them now, while no callback thread exists.
+        FlushBoundPlaybackStreams(device);
+
         device->thread = SDL_CreateThread(device->recording ? RecordingAudioThread : PlaybackAudioThread, threadname, device);
 
         if (!device->thread) {
@@ -1998,6 +2036,10 @@ static bool OpenPhysicalAudioDevice(SDL_AudioDevice *device, const SDL_AudioSpec
             ClosePhysicalAudioDevice(device);
             return SDL_SetError("Couldn't create audio thread");
         }
+    } else {
+        // Backends that drive their own callback thread won't start one here; flush
+        // before PostOpenDevice arms their callbacks instead.
+        FlushBoundPlaybackStreams(device);
     }
 
     SDL_LogDebug(SDL_LOG_CATEGORY_AUDIO, "AUDIO: attempt to open %s device '%s' succeeded! Opened at spec (%s,%d,%d)", devtypestr, device->name, GetShortAudioFormatName(device->spec.format), device->spec.channels, device->spec.freq);
@@ -2299,6 +2341,9 @@ void SDL_UnbindAudioStreams(SDL_AudioStream * const *streams, int num_streams)
         SDL_AudioStream *stream = streams[i];
         // don't allow unbinding from "simplified" devices (opened with SDL_OpenAudioDeviceStream). Just ignore them.
         if (stream && stream->bound_device && !stream->bound_device->simplified) {
+            // discard samples queued for this device run before detaching, so a later
+            // bind/reopen can't replay them as stale audio.
+            DetachPlaybackStream(stream->bound_device->physical_device, stream);
             if (stream->bound_device->bound_streams == stream) {
                 SDL_assert(!stream->prev_binding);
                 stream->bound_device->bound_streams = stream->next_binding;
